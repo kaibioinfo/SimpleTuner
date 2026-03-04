@@ -2732,6 +2732,18 @@ class Trainer:
                 if key in self.lycoris_config:
                     del self.lycoris_config[key]
 
+            # kaidu patch orthogonal lora
+            if "orthogonal" in self.lycoris_config:
+                if self.lycoris_config["algo"] not in {"lora", "locon"}:
+                    raise ValueError("orthogonal option is only valid for lora/locon algo, but '%s' is given" % self.lycoris_config["algo"])
+                self.orthogonal_index = self.lycoris_config["orthogonal"]["index"]
+                self.orthogonal_size = self.lycoris_config["orthogonal"]["size"]
+                self.orthogonal_seed = self.lycoris_config["orthogonal"]["seed"] if "seed" is in self.lycoris_config["orthogonal"] else 0
+                logger.info("Using orthogonal lora training with index %d / %d" % (self.orthogonal_index, self.orthogonal_size))
+            else:
+                self.orthogonal_index = None
+                self.orthogonal_splits = None
+
             logger.info("Using lycoris training mode")
             self._send_webhook_msg(message="Using lycoris training mode.")
 
@@ -2769,7 +2781,37 @@ class Trainer:
             logger.info(
                 f"LyCORIS network has been initialized with {trainable_parameter_count(self.lycoris_wrapped_network.parameters())} parameters"
             )
+            if self.orthogonal_index is not None:
+                self.__enable_orthogonal_lora_training(lycoris_wrapped_network)
+
+
         self.accelerator.wait_for_everyone()
+
+
+
+    def __enable_orthogonal_lora_training(self, model):
+        import torch
+        import torch.nn as nn
+        import re
+        import hashlib
+        # Initialize orthogonal matrices
+        for (name, module) in model.named_modules():
+            if hasattr(module, 'lora_down') and isinstance(module.lora_down, nn.Module):
+                target_param_name = "weight"
+                if not hasattr(module.lora_down, target_param_name):
+                    continue
+
+                seed = int(hashlib.sha256(name.encode('utf-8')).hexdigest(),16)^self.orthogonal_seed
+                generator = torch.Generator(device=module.lora_down.weight.device)
+                generator.manual_seed(seed)
+                total_rank = self.orthogonal_size * module.lora_dim
+                matrix = torch.zeros((module.lora_down.weight.size(0), total_rank), device=module.lora_down.weight.device, dtype=module.lora_down.weight.dtype)
+                nn.init.orthogonal_(matrix, generator=generator)
+                submatrix = matrix[:, (self.orthogonal_index*module.lora_dim):((self.orthogonal_index+1)*module.lora_dim)]
+                module.lora_down.weight.set_(submatrix/(submatrix.norm()*0.15))
+                # disable training
+                module.lora_down.weight.requires_grad = False
+                logger.info("Orthogonal initialization of %s with submatrix of size %d x %d. First value in matrix is %f. First value in total matrix is %f" % (name, submatrix.size(0), submatrix.size(1), submatrix[0,0].item(), matrix[0,0].item()) )
 
     def init_lyrics_embedder_training(self):
         """
