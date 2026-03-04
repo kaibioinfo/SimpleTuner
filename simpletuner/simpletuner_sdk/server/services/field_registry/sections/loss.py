@@ -1055,3 +1055,20 @@ def register_loss_fields(registry: "FieldRegistry") -> None:
             documentation="OPTIONS.md#--urepa_threshold_mode",
         )
     )
+
+    registry._add_field(
+        ConfigField(
+            name="preservation_reg_strength",
+            arg_name="--preservation_reg_strength",
+            ui_label="Preservation regularization strength",
+            field_type=FieldType.NUMBER,
+            tab="training",
+            section="loss_functions",
+            default_value="1.0",
+            help_text="The preservation loss for regularization images is multiplied by this value.",
+            tooltip="The preservation loss for regularization images is multiplied by this value.",
+            importance=ImportanceLevel.EXPERIMENTAL,
+            order=55,
+            documentation="OPTIONS.md#--preservation_reg_strength",
+        )
+    )
