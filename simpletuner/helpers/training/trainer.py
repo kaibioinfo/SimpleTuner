@@ -267,6 +267,8 @@ class Trainer:
         self.sidecar_lr = None
         self.sidecar_is_schedulefree = False
         self.sidecar_scheduler_disabled = False
+        self._tlora_active = False
+        self._tlora_config = {}
         self._attention_max_logits: Optional[Dict[str, torch.Tensor]] = None
         self._ramtorch_zero_state: Optional[dict] = None
         self._hub_upload_executor: ThreadPoolExecutor | None = None
@@ -2719,15 +2721,32 @@ class Trainer:
 
             with open(self.config.lycoris_config, "r") as f:
                 self.lycoris_config = json.load(f)
+
+            if self.lycoris_config.get("algo") == "tlora":
+                from simpletuner.helpers.training.lycoris import TLORA_AVAILABLE
+
+                if not TLORA_AVAILABLE:
+                    raise ImportError(
+                        "algo='tlora' requires a LyCORIS version with T-LoRA support. "
+                        "Please upgrade LyCORIS to a version that includes lycoris.modules.tlora."
+                    )
+                if isinstance(self.model, VideoModelFoundation):
+                    logger.warning(
+                        "T-LoRA with video models may produce subpar results due to "
+                        "temporal compression blending frames across timestep boundaries."
+                    )
+
             multiplier = int(self.lycoris_config.get("multiplier", 1))
             linear_dim = int(self.lycoris_config.get("linear_dim", 4))
             linear_alpha = int(self.lycoris_config.get("linear_alpha", 1))
+            tlora_min_rank = int(self.lycoris_config.get("tlora_min_rank", 1))
+            tlora_alpha = float(self.lycoris_config.get("tlora_alpha", 1.0))
             apply_preset = self.lycoris_config.get("apply_preset", None)
             if apply_preset is not None and apply_preset != {}:
                 LycorisNetwork.apply_preset(apply_preset)
 
             # Remove the positional arguments we extracted.
-            keys_to_remove = ["multiplier", "linear_dim", "linear_alpha"]
+            keys_to_remove = ["multiplier", "linear_dim", "linear_alpha", "tlora_min_rank", "tlora_alpha"]
             for key in keys_to_remove:
                 if key in self.lycoris_config:
                     del self.lycoris_config[key]
@@ -2773,11 +2792,20 @@ class Trainer:
                     )
 
             self.lycoris_wrapped_network.apply_to()
+            if self.lycoris_config.get("algo") == "tlora":
+                self._tlora_active = True
+                self._tlora_config = {
+                    "max_rank": linear_dim,
+                    "min_rank": tlora_min_rank,
+                    "alpha": tlora_alpha,
+                }
             setattr(
                 self.accelerator,
                 "_lycoris_wrapped_network",
                 self.lycoris_wrapped_network,
             )
+            setattr(self.accelerator, "_tlora_active", self._tlora_active)
+            setattr(self.accelerator, "_tlora_config", self._tlora_config)
             logger.info(
                 f"LyCORIS network has been initialized with {trainable_parameter_count(self.lycoris_wrapped_network.parameters())} parameters"
             )
@@ -2933,6 +2961,20 @@ class Trainer:
             if self.config.lora_type == "lycoris":
                 return self.lycoris_wrapped_network.parameters()
         return [param for param in self.model.get_trained_component(unwrap_model=False).parameters() if param.requires_grad]
+
+    def _get_slider_tuner_layers(self):
+        """Return cached list of (id, module) for BaseTunerLayer modules that have scaling dicts."""
+        if hasattr(self, "_slider_tuner_layers_cache"):
+            return self._slider_tuner_layers_cache
+
+        from peft.tuners.tuners_utils import BaseTunerLayer
+
+        result = []
+        for name, module in self.model.get_trained_component().named_modules():
+            if isinstance(module, BaseTunerLayer) and hasattr(module, "scaling"):
+                result.append((id(module), module))
+        self._slider_tuner_layers_cache = result
+        return result
 
     def _ensure_parameter_dtype(self, parameters, target_dtype: torch.dtype, optimizer_name: str | None = None):
         converted = 0
@@ -4583,11 +4625,15 @@ class Trainer:
         if hub_upload_planned:
             if self.accelerator.is_main_process:
                 validation_images = getattr(self.validation, "validation_images") if self.validation is not None else None
+                captured_step = self.state["global_step"]
+                captured_epoch = self.state["current_epoch"]
 
                 def _upload_latest_checkpoint():
                     remote_path, local_path, repo_url = self.hub_manager.upload_latest_checkpoint(
                         validation_images=validation_images,
                         webhook_handler=self.webhook_handler,
+                        global_step=captured_step,
+                        epoch=captured_epoch,
                     )
                     return remote_path, local_path, repo_url
 
@@ -4916,21 +4962,37 @@ class Trainer:
                 self.noise_scheduler,
                 self.config,
             )
-        if not self.config.disable_accelerator:
-            if self.config.controlnet:
-                model_pred = self.model.controlnet_predict(
-                    prepared_batch=prepared_batch,
-                )
-            else:
-                model_pred = self.model.model_predict(
-                    prepared_batch=prepared_batch,
-                )
 
-        else:
-            # Dummy model prediction for debugging.
-            if not self.model.uses_noise_schedule():
-                raise ValueError("disable_accelerator debug path is not supported for autoregressive models.")
-            model_pred = torch.randn_like(prepared_batch["noisy_latents"])
+        if self._tlora_active:
+            from simpletuner.helpers.training.lycoris import apply_tlora_timestep_mask, clear_tlora_mask
+
+            apply_tlora_timestep_mask(
+                timesteps=prepared_batch["timesteps"],
+                max_timestep=self.noise_scheduler.config.num_train_timesteps,
+                max_rank=self._tlora_config["max_rank"],
+                min_rank=self._tlora_config["min_rank"],
+                alpha=self._tlora_config["alpha"],
+            )
+
+        try:
+            if not self.config.disable_accelerator:
+                if self.config.controlnet:
+                    model_pred = self.model.controlnet_predict(
+                        prepared_batch=prepared_batch,
+                    )
+                else:
+                    model_pred = self.model.model_predict(
+                        prepared_batch=prepared_batch,
+                    )
+
+            else:
+                # Dummy model prediction for debugging.
+                if not self.model.uses_noise_schedule():
+                    raise ValueError("disable_accelerator debug path is not supported for autoregressive models.")
+                model_pred = torch.randn_like(prepared_batch["noisy_latents"])
+        finally:
+            if self._tlora_active:
+                clear_tlora_mask()
 
         # x-prediction requires that we now subtract the noise residual from the prediction to get the target sample.
         if (
@@ -5473,6 +5535,28 @@ class Trainer:
                             else:
                                 self.model.get_trained_component().enable_lora()
 
+                    # slider
+                    raw_strength = prepared_batch.get("slider_strength", 1.0)
+                    try:
+                        strength = float(raw_strength)
+                    except (TypeError, ValueError):
+                        strength = 1.0
+
+                    slider_original_scaling = None
+                    if self.config.model_type == "lora" and strength != 1.0:
+                        with torch.no_grad():
+                            if self.config.lora_type.lower() == "lycoris":
+                                self.accelerator._lycoris_wrapped_network.set_multiplier(strength)
+                            else:
+                                tuner_layers = self._get_slider_tuner_layers()
+                                slider_original_scaling = {}
+                                for layer_id, module in tuner_layers:
+                                    saved = {}
+                                    for key, val in module.scaling.items():
+                                        saved[key] = val
+                                        module.scaling[key] = val * strength
+                                    slider_original_scaling[layer_id] = (module, saved)
+
                     training_logger.debug("Predicting.")
                     model_pred = self.model_predict(
                         prepared_batch=prepared_batch,
@@ -5643,6 +5727,14 @@ class Trainer:
                         ):
                             self.distiller.discriminator_step(prepared_batch=prepared_batch)
                             self.distiller.post_training_step(self.model, step)
+                    if self.config.model_type == "lora" and strength != 1:
+                        with torch.no_grad():
+                            if self.config.lora_type.lower() == "lycoris":
+                                self.accelerator._lycoris_wrapped_network.set_multiplier(1.0)
+                            elif slider_original_scaling is not None:
+                                for module, saved in slider_original_scaling.values():
+                                    for key, val in saved.items():
+                                        module.scaling[key] = val
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 wandb_logs = {}
@@ -6089,9 +6181,16 @@ class Trainer:
                 logger.info(f"Wrote pipeline to disk: {self.config.output_dir}/pipeline")
 
             if self.hub_manager is not None and self.accelerator.is_main_process:
+                captured_step = self.state["global_step"]
+                captured_epoch = self.state["current_epoch"]
 
                 def _upload_final_model():
-                    repo_url = self.hub_manager.upload_model(validation_images, self.webhook_handler)
+                    repo_url = self.hub_manager.upload_model(
+                        validation_images,
+                        self.webhook_handler,
+                        global_step=captured_step,
+                        epoch=captured_epoch,
+                    )
                     return repo_url, self.config.output_dir, repo_url
 
                 try:
